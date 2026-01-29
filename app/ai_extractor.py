@@ -1,130 +1,228 @@
-from pdf2image import convert_from_path
-import pytesseract
-from schema import ExtractedSaleData
 import json
-import requests
+import logging
 import re
+import argparse
+from typing import Dict
 
-# Ollama API configuration
+import pdfplumber
+import requests
+from pydantic import ValidationError
+
+from schema import ExtractedSaleData
+
+# =========================================================
+# LOGGING CONFIGURATION
+# =========================================================
+
+logger = logging.getLogger("ai_extractor")
+logger.setLevel(logging.INFO)
+
+handler = logging.StreamHandler()
+formatter = logging.Formatter(
+    "[%(asctime)s] %(levelname)s | %(name)s | %(message)s"
+)
+handler.setFormatter(formatter)
+
+if not logger.handlers:
+    logger.addHandler(handler)
+
+# =========================================================
+# OLLAMA CONFIG
+# =========================================================
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3:latest"
+OLLAMA_MODEL = "mistral"
+OLLAMA_TIMEOUT = 180
 
-# Maximum characters per chunk to avoid 500 errors
-MAX_CHUNK_SIZE = 2000
+# =========================================================
+# PROMPTS
+# =========================================================
 
+TEXT_CLEANUP_PROMPT = """
+You are a document reconstruction engine.
+
+Given raw extracted text from a PDF:
+- Remove noise
+- Merge broken lines
+- Preserve tables in text form
+- Preserve headings and sections
+- DO NOT summarize
+- DO NOT add new information
+- Return clean, readable document text ONLY
+
+DOCUMENT:
+-----------------
+{raw_text}
+-----------------
+"""
+
+DATA_EXTRACTION_PROMPT = """
+Extract buyer and coffee sale details.
+
+Return STRICT JSON ONLY:
+
+{
+  "buyer": "string",
+  "coffee_details": [
+    {
+      "seller": "string",
+      "outturn": "string",
+      "grade": "string",
+      "bags": number | null,
+      "pockets": number | null,
+      "weight_kg": number
+    }
+  ]
+}
+
+Rules:
+- Output MUST be valid JSON
+- Use null instead of None
+- No trailing commas
+- No markdown
+- No explanation
+- Use exact values only
+- No inference
+
+DOCUMENT:
+-----------------
+{document_text}
+-----------------
+"""
+
+# =========================================================
+# PDF TEXT EXTRACTION
+# =========================================================
 
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """
-    Extract text from a PDF file using OCR.
+    logger.info("Extracting text from PDF: %s", pdf_path)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pages = [page.extract_text() or "" for page in pdf.pages]
+        return "\n".join(pages)
+    except Exception as e:
+        logger.exception("Failed to extract PDF text")
+        raise RuntimeError("PDF extraction failed") from e
 
-    Args:
-        pdf_path (str): The path to the PDF file.
+# =========================================================
+# OLLAMA CLIENT
+# =========================================================
 
-    Returns:
-        str: The extracted text.
-    """
-    images = convert_from_path(pdf_path)
-    extracted_text = ""
-    for image in images:
-        text = pytesseract.image_to_string(image)
-        extracted_text += text + "\n"
-    return extracted_text
-
-
-def clean_llm_json(text: str) -> str:
-    """
-    Extract only the JSON list from LLM output, removing extra text, code blocks, or comments.
-    """
-    # Remove code blocks
-    text = text.replace("```", "")
-    # Remove inline comments (e.g., # in kgs)
-    text = re.sub(r"#.*", "", text)
-    # Extract first JSON list
-    match = re.search(r"\[\s*(\{.*?\})\s*(,\s*\{.*?\}\s*)*\]", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON list found in LLM output:\n{text}")
-    return match.group(0).strip()
-
-
-def run_llm_extraction(system_prompt: str, user_prompt_template: str, text: str):
-    """
-    Safely run LLM extraction on large PDF text by chunking.
-
-    Args:
-        system_prompt (str): Instructions for the AI assistant.
-        user_prompt_template (str): Template including schema and text.
-        text (str): Full extracted PDF text.
-
-    Returns:
-        List[ExtractedSaleData]: List of structured extracted sale data.
-    """
-    # Split text into chunks
-    chunks = [text[i:i + MAX_CHUNK_SIZE] for i in range(0, len(text), MAX_CHUNK_SIZE)]
-    results = []
-
-    for idx, chunk in enumerate(chunks):
-        prompt = user_prompt_template.format(ExtractedSaleData=ExtractedSaleData, text=chunk)
-        payload = {
-            "model": MODEL,
-            "prompt": f"{system_prompt}\n\n{prompt}",
-            "stream": False
-        }
-        print(f"Processing chunk {idx + 1}/{len(chunks)}...")
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-        response.raise_for_status()
-
-        # Parse Ollama wrapper JSON
-        outer = response.json()
-        llm_text = outer.get("response", "")
-        if not llm_text:
-            raise ValueError(f"No 'response' field found in Ollama output:\n{response.text}")
-
-        # Extract clean JSON list
-        json_only = clean_llm_json(llm_text)
-        results.append(json_only)
-
-    # Combine all chunk outputs
-    final_output = "\n".join(results).strip()
+def call_ollama(prompt: str) -> str:
+    logger.info("Calling Ollama model: %s", OLLAMA_MODEL)
 
     try:
-        data_list = json.loads(final_output)
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0
+                }
+            },
+            timeout=OLLAMA_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+
+    except requests.RequestException as e:
+        logger.exception("Ollama request failed")
+        raise RuntimeError("LLM request failed") from e
+
+# =========================================================
+# TEXT CLEANUP
+# =========================================================
+
+def clean_document_text(raw_text: str) -> str:
+    logger.info("Cleaning document text via LLM")
+
+    prompt = TEXT_CLEANUP_PROMPT.format(raw_text=raw_text)
+    return call_ollama(prompt)
+
+# =========================================================
+# JSON EXTRACTION (DEFENSIVE)
+# =========================================================
+
+def extract_json(llm_output: str) -> Dict:
+    logger.info("Extracting JSON from LLM output")
+
+    match = re.search(r"\{.*\}", llm_output, re.DOTALL)
+    if not match:
+        logger.error("No JSON found in LLM output")
+        raise ValueError("Invalid LLM output: JSON not found")
+
+    json_str = match.group(0)
+    json_str = json_str.replace("None", "null")
+
+    try:
+        return json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse LLM output as JSON: {e}\nOutput:\n{final_output}")
+        logger.exception("JSON parsing failed")
+        raise ValueError("Invalid JSON structure") from e
 
-    # Convert JSON to ExtractedSaleData objects
-    return [ExtractedSaleData(**item) for item in data_list]
+# =========================================================
+# DATA EXTRACTION
+# =========================================================
 
+def extract_sale_data(clean_text: str) -> Dict:
+    logger.info("Extracting structured sale data")
+
+    prompt = DATA_EXTRACTION_PROMPT.format(
+        document_text=clean_text
+    )
+
+    llm_output = call_ollama(prompt)
+    return extract_json(llm_output)
+
+# =========================================================
+# SCHEMA VALIDATION
+# =========================================================
+
+def validate_sale_data(data: Dict) -> ExtractedSaleData:
+    logger.info("Validating extracted data against schema")
+
+    try:
+        return ExtractedSaleData(**data)
+    except ValidationError as e:
+        logger.exception("Schema validation failed")
+        raise ValueError("Schema validation error") from e
+
+# =========================================================
+# PIPELINE ORCHESTRATOR
+# =========================================================
+
+def run_extraction_pipeline(pdf_path: str) -> ExtractedSaleData:
+    logger.info("Starting extraction pipeline")
+
+    raw_text = extract_text_from_pdf(pdf_path)
+    clean_text = clean_document_text(raw_text)
+    structured_data = extract_sale_data(clean_text)
+    validated_data = validate_sale_data(structured_data)
+
+    logger.info("Extraction pipeline completed successfully")
+    return validated_data
+
+# =========================================================
+# MAIN ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
-    pdf_file_path = "/home/skull-walla/Downloads/kisumu_sale_1.pdf"
+    parser = argparse.ArgumentParser(
+        description="Extract structured coffee sale data from PDF"
+    )
+    parser.add_argument(
+        "pdf_path",
+        help="Path to the PDF file to process"
+    )
 
-    SYSTEM_PROMPT = """
-    You are an AI assistant that extracts text from PDF.
-    Extract Coffee Sale data from noisy PDF text.
+    args = parser.parse_args()
 
-    Rules:
-    - Normalize spelling mistakes.
-    - Weight must be in kgs.
-    - Price must be in USD.
-    - Single buyer per document.
+    try:
+        result = run_extraction_pipeline(args.pdf_path)
+        print(json.dumps(result.model_dump(), indent=2))
 
-    Return a valid list of dicts.
-    """
-
-    USER_PROMPT = """
-    Extract the coffee sale data using this schema:
-
-    {ExtractedSaleData.model_json_schema}
-
-    Text:
-    {text}
-    """
-
-    # Extract text from PDF
-    text = extract_text_from_pdf(pdf_file_path)
-
-    # Run extraction
-    data_list = run_llm_extraction(SYSTEM_PROMPT, USER_PROMPT, text)
-
-    # Print structured output as JSON
-    print(json.dumps([data.dict() for data in data_list], indent=4))
+    except Exception as e:
+        logger.error("Extraction failed: %s", e)
+        exit(1)
