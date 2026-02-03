@@ -6,10 +6,9 @@ class CoffeeLot(BaseModel):
     outturn: str
     grade: str
     bags: Optional[int]
-    pockets: Optional[int]
-    weight: float
-
+    pockets: int = 0
+    weight_kg: float  # changed to match your JSON
 
 class ExtractedSaleData(BaseModel):
     buyer: str
-    coffee: List[CoffeeLot]
+    coffee_details: List[CoffeeLot]  # changed to match your JSON

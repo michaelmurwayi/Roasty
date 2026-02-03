@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import argparse
-from typing import Dict
+from typing import Dict, Any
 
 import pdfplumber
 import requests
@@ -30,31 +30,15 @@ if not logger.handlers:
 # OLLAMA CONFIG
 # =========================================================
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "mistral"
+OLLAMA_URL = "http://192.168.1.213:11434/api/generate"
+OLLAMA_MODEL = "llama3"
 OLLAMA_TIMEOUT = 180
 
 # =========================================================
 # PROMPTS
 # =========================================================
 
-TEXT_CLEANUP_PROMPT = """
-You are a document reconstruction engine.
 
-Given raw extracted text from a PDF:
-- Remove noise
-- Merge broken lines
-- Preserve tables in text form
-- Preserve headings and sections
-- DO NOT summarize
-- DO NOT add new information
-- Return clean, readable document text ONLY
-
-DOCUMENT:
------------------
-{raw_text}
------------------
-"""
 
 DATA_EXTRACTION_PROMPT = """
 Extract buyer and coffee sale details.
@@ -77,6 +61,7 @@ Return STRICT JSON ONLY:
 
 Rules:
 - Output MUST be valid JSON
+- Keys must not contain whitespace or newlines
 - Use null instead of None
 - No trailing commas
 - No markdown
@@ -118,11 +103,9 @@ def call_ollama(prompt: str) -> str:
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                "options": {
-                    "temperature": 0
-                }
+                "options": {"temperature": 0},
             },
-            timeout=OLLAMA_TIMEOUT
+            timeout=OLLAMA_TIMEOUT,
         )
         response.raise_for_status()
         return response.json()["response"]
@@ -136,10 +119,92 @@ def call_ollama(prompt: str) -> str:
 # =========================================================
 
 def clean_document_text(raw_text: str) -> str:
-    logger.info("Cleaning document text via LLM")
+    logger.info("Cleaning and extracting structured coffee data using Python")
 
-    prompt = TEXT_CLEANUP_PROMPT.format(raw_text=raw_text)
-    return call_ollama(prompt)
+    text = re.sub(r"\s{2,}", " ", raw_text)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    buyer = None
+    coffee_details = []
+
+    current_lot = {}
+
+    for line in lines:
+        lower = line.lower()
+
+        # -------- BUYER --------
+        if buyer is None and "buyer" in lower:
+            # e.g. Buyer: Kisumu Limited Liability Company
+            buyer = line.split(":", 1)[-1].strip()
+            continue
+
+        # -------- SELLER / FARM --------
+        if any(k in lower for k in ["fcs", "farm", "estate"]):
+            if current_lot:
+                coffee_details.append(current_lot)
+                current_lot = {}
+
+            current_lot["seller"] = line
+            continue
+
+        # -------- OUTTURN --------
+        if "outturn" in lower:
+            current_lot["outturn"] = line.split()[-1]
+            continue
+
+        # -------- GRADE --------
+        if "grade" in lower:
+            current_lot["grade"] = line.split()[-1]
+            continue
+
+        # -------- BAGS --------
+        if "bag" in lower:
+            match = re.search(r"\d+", line)
+            current_lot["bags"] = int(match.group()) if match else None
+            continue
+
+        # -------- POCKETS --------
+        if "pocket" in lower:
+            match = re.search(r"\d+", line)
+            current_lot["pockets"] = int(match.group()) if match else None
+            continue
+
+        # -------- WEIGHT --------
+        if "kg" in lower:
+            match = re.search(r"\d+", line)
+            if match:
+                current_lot["weight_kg"] = int(match.group())
+            continue
+
+    if current_lot:
+        coffee_details.append(current_lot)
+
+    result = {
+        "buyer": buyer,
+        "coffee_details": coffee_details
+    }
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+# =========================================================
+# JSON NORMALIZATION (FIX)
+# =========================================================
+
+def normalize_keys(obj: Any) -> Any:
+    """
+    Recursively normalize dictionary keys:
+    - strip whitespace
+    - remove stray quotes
+    """
+    if isinstance(obj, dict):
+        return {
+            k.strip().strip('"'): normalize_keys(v)
+            for k, v in obj.items()
+        }
+    elif isinstance(obj, list):
+        return [normalize_keys(i) for i in obj]
+    return obj
 
 # =========================================================
 # JSON EXTRACTION (DEFENSIVE)
@@ -153,28 +218,16 @@ def extract_json(llm_output: str) -> Dict:
         logger.error("No JSON found in LLM output")
         raise ValueError("Invalid LLM output: JSON not found")
 
-    json_str = match.group(0)
-    json_str = json_str.replace("None", "null")
+    json_str = match.group(0).replace("None", "null")
 
     try:
-        return json.loads(json_str)
+        data = json.loads(json_str)
+        return normalize_keys(data)
     except json.JSONDecodeError as e:
         logger.exception("JSON parsing failed")
         raise ValueError("Invalid JSON structure") from e
 
-# =========================================================
-# DATA EXTRACTION
-# =========================================================
 
-def extract_sale_data(clean_text: str) -> Dict:
-    logger.info("Extracting structured sale data")
-
-    prompt = DATA_EXTRACTION_PROMPT.format(
-        document_text=clean_text
-    )
-
-    llm_output = call_ollama(prompt)
-    return extract_json(llm_output)
 
 # =========================================================
 # SCHEMA VALIDATION
@@ -184,7 +237,8 @@ def validate_sale_data(data: Dict) -> ExtractedSaleData:
     logger.info("Validating extracted data against schema")
 
     try:
-        return ExtractedSaleData(**data)
+        print(data)
+        return ExtractedSaleData.model_validate_json(data)
     except ValidationError as e:
         logger.exception("Schema validation failed")
         raise ValueError("Schema validation error") from e
@@ -198,8 +252,7 @@ def run_extraction_pipeline(pdf_path: str) -> ExtractedSaleData:
 
     raw_text = extract_text_from_pdf(pdf_path)
     clean_text = clean_document_text(raw_text)
-    structured_data = extract_sale_data(clean_text)
-    validated_data = validate_sale_data(structured_data)
+    validated_data = validate_sale_data(clean_text)
 
     logger.info("Extraction pipeline completed successfully")
     return validated_data
